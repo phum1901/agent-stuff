@@ -10,8 +10,15 @@
   },
   "license": "MIT",
   "pi": {
-    "extensions": ["./extensions"],
+    "extensions": [
+      "./extensions",
+      "./node_modules/mitsupi/extensions/btw.ts",
+      "./node_modules/mitsupi/extensions/whimsical.ts"
+    ],
     "skills": ["./skills"]
+  },
+  "dependencies": {
+    "mitsupi": "github:mitsuhiko/agent-stuff#122e2994adddb113c04764c5697217dae120fcc6"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

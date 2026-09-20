@@ -20,8 +20,11 @@ pi install -l git:github.com/phum1901/agent-stuff
 
 - `prompt-editor.ts` - Adds prompt history, model modes, mode switching, and a mode label in the editor.
 - `tps-stats.ts` - Shows output tokens per second and token usage after each turn.
+- [`btw.ts`](https://github.com/mitsuhiko/agent-stuff/blob/main/extensions/btw.ts) - Adds a `/btw` side-chat popover for quick tangential questions.
+- [`whimsical.ts`](https://github.com/mitsuhiko/agent-stuff/blob/main/extensions/whimsical.ts) - Replaces the default thinking and status text with random whimsical phrases.
 
 The prompt editor stores modes in `~/.pi/agent/modes.json`, or in `.pi/modes.json` when a project file exists.
+The external extensions are installed from the pinned `mitsuhiko/agent-stuff` dependency.
 
 ## Skills
 
