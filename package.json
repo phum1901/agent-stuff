@@ -1,0 +1,19 @@
+{
+  "name": "pi-agent-stuff",
+  "version": "0.1.0",
+  "description": "Useful extensions for pi coding agent",
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension", "pi-skill"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/phum1901/agent-stuff.git"
+  },
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
