@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { CONFIG_DIR_NAME, SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // =============================================================================
@@ -15,7 +15,7 @@ type AutoCompactConfig = {
 	usedTokensEnabled?: boolean;
 };
 
-type ConfigIssue = { path: "global" | "project"; message: string };
+type ConfigIssue = { message: string };
 
 type ThresholdSource = "remaining" | "percent" | "used";
 
@@ -44,39 +44,35 @@ function globalConfigPath(): string {
 	return join(getAgentDir(), FILE_NAME);
 }
 
-function projectConfigPath(cwd: string): string {
-	return join(cwd, CONFIG_DIR_NAME, FILE_NAME);
-}
-
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function parseFile(raw: unknown, path: ConfigIssue["path"], issues: ConfigIssue[]): Partial<AutoCompactConfig> {
+function parseFile(raw: unknown, issues: ConfigIssue[]): Partial<AutoCompactConfig> {
 	if (raw === undefined) return {};
 	if (!isPlainObject(raw)) {
-		issues.push({ path, message: "config must be a JSON object, file ignored" });
+		issues.push({ message: "config must be a JSON object, file ignored" });
 		return {};
 	}
 	const out: Partial<AutoCompactConfig> = {};
 	if (raw.enabled !== undefined) {
 		if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
-		else issues.push({ path, message: `enabled must be boolean, got ${JSON.stringify(raw.enabled)}, ignored` });
+		else issues.push({ message: `enabled must be boolean, got ${JSON.stringify(raw.enabled)}, ignored` });
 	}
 	if (raw.percentThreshold !== undefined) {
 		const v = raw.percentThreshold;
 		if (typeof v === "number" && Number.isFinite(v) && v > 0 && v <= 100) out.percentThreshold = v;
-		else issues.push({ path, message: `percentThreshold must be in (0, 100], got ${JSON.stringify(v)}, ignored` });
+		else issues.push({ message: `percentThreshold must be in (0, 100], got ${JSON.stringify(v)}, ignored` });
 	}
 	if (raw.usedTokensThreshold !== undefined) {
 		const v = raw.usedTokensThreshold;
 		if (typeof v === "number" && Number.isInteger(v) && v > 0) out.usedTokensThreshold = v;
-		else issues.push({ path, message: `usedTokensThreshold must be a positive integer, got ${JSON.stringify(v)}, ignored` });
+		else issues.push({ message: `usedTokensThreshold must be a positive integer, got ${JSON.stringify(v)}, ignored` });
 	}
 	for (const field of ["percentEnabled", "usedTokensEnabled"] as const) {
 		if (raw[field] !== undefined) {
 			if (typeof raw[field] === "boolean") (out as Record<string, unknown>)[field] = raw[field];
-			else issues.push({ path, message: `${field} must be boolean, got ${JSON.stringify(raw[field])}, ignored` });
+			else issues.push({ message: `${field} must be boolean, got ${JSON.stringify(raw[field])}, ignored` });
 		}
 	}
 	return out;
@@ -91,20 +87,15 @@ function readJson(path: string): unknown {
 	}
 }
 
-function loadConfig(cwd: string): { config: AutoCompactConfig; issues: ConfigIssue[] } {
+function loadConfig(): { config: AutoCompactConfig; issues: ConfigIssue[] } {
 	const issues: ConfigIssue[] = [];
-	const globalRaw = readJson(globalConfigPath());
-	if (isPlainObject(globalRaw) && typeof globalRaw.__parseError === "string") {
-		issues.push({ path: "global", message: `JSON parse failed: ${globalRaw.__parseError}, global config ignored` });
-	}
-	const projectRaw = readJson(projectConfigPath(cwd));
-	if (isPlainObject(projectRaw) && typeof projectRaw.__parseError === "string") {
-		issues.push({ path: "project", message: `JSON parse failed: ${projectRaw.__parseError}, project config ignored` });
+	const raw = readJson(globalConfigPath());
+	if (isPlainObject(raw) && typeof raw.__parseError === "string") {
+		issues.push({ message: `JSON parse failed: ${raw.__parseError}, config ignored` });
 	}
 	const config: AutoCompactConfig = {
 		enabled: true,
-		...parseFile(isPlainObject(globalRaw) && !("__parseError" in globalRaw) ? globalRaw : undefined, "global", issues),
-		...parseFile(isPlainObject(projectRaw) && !("__parseError" in projectRaw) ? projectRaw : undefined, "project", issues),
+		...parseFile(isPlainObject(raw) && !("__parseError" in raw) ? raw : undefined, issues),
 	};
 	return { config, issues };
 }
@@ -176,7 +167,7 @@ export default function (pi: ExtensionAPI) {
 	const fmt = (n: number): string => n.toLocaleString("en-US");
 
 	const reloadAll = (cwd: string): void => {
-		const loaded = loadConfig(cwd);
+		const loaded = loadConfig();
 		config = loaded.config;
 		issues = loaded.issues;
 		try {
@@ -300,14 +291,14 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (issues.length > 0) {
 			lines.push("Config issues:");
-			for (const issue of issues) lines.push(`  - [${issue.path}] ${issue.message}`);
+			for (const issue of issues) lines.push(`  - ${issue.message}`);
 		}
-		lines.push(`Config files: global ${globalConfigPath()}; project ${projectConfigPath(ctx.cwd)} (project wins)`);
+		lines.push(`Config file: ${globalConfigPath()}`);
 		return { lines, level: issues.length > 0 ? "warning" : "info" };
 	};
 
-	const writeProjectConfig = (cwd: string, mutate: (obj: Record<string, unknown>) => void): string => {
-		const path = projectConfigPath(cwd);
+	const writeConfig = (cwd: string, mutate: (obj: Record<string, unknown>) => void): string => {
+		const path = globalConfigPath();
 		let obj: Record<string, unknown> = {};
 		if (existsSync(path)) {
 			try {
@@ -315,7 +306,7 @@ export default function (pi: ExtensionAPI) {
 				if (isPlainObject(parsed)) obj = { ...parsed };
 				else throw new Error("config must be a JSON object");
 			} catch (error) {
-				throw new Error(`project config JSON broken (${error instanceof Error ? error.message : String(error)}), fix it first`);
+				throw new Error(`config JSON broken (${error instanceof Error ? error.message : String(error)}), fix it first`);
 			}
 		}
 		mutate(obj);
@@ -348,7 +339,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("auto-compact", {
-		description: "Show auto-compact thresholds (no args) or set them: percent|used on|off|<value>",
+		description: "Manage auto-compact thresholds (menu, or percent|used on|off|<value>)",
 		getArgumentCompletions: (prefix) => {
 			const on = (target: "percent" | "used") => ({
 				value: `${target} on`,
@@ -401,7 +392,7 @@ export default function (pi: ExtensionAPI) {
 					target === "percent"
 						? { valueField: "percentThreshold", flagField: "percentEnabled", label: "percentThreshold" }
 						: { valueField: "usedTokensThreshold", flagField: "usedTokensEnabled", label: "usedTokensThreshold" };
-				const path = writeProjectConfig(ctx.cwd, (obj) => {
+				const path = writeConfig(ctx.cwd, (obj) => {
 					obj[meta.valueField] = value;
 					delete obj[meta.flagField];
 				});
@@ -421,7 +412,7 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				}
-				const path = writeProjectConfig(ctx.cwd, (obj) => {
+				const path = writeConfig(ctx.cwd, (obj) => {
 					if (next) delete obj[meta.flagField];
 					else obj[meta.flagField] = false;
 				});
@@ -451,52 +442,72 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!ctx.hasUI) return;
 
-			const percentText =
-				config.percentThreshold === undefined
-					? "not set"
-					: `${config.percentThreshold}% (${config.percentEnabled === false ? "off" : "on"})`;
-			const usedText =
-				config.usedTokensThreshold === undefined
-					? "not set"
-					: `${fmt(config.usedTokensThreshold)} tokens (${config.usedTokensEnabled === false ? "off" : "on"})`;
-
 			for (;;) {
-				const choice = await ctx.ui.select("Auto-compact thresholds (Esc exits)", [
-					`Set percent value… (now ${percentText})`,
-					`${config.percentEnabled === false ? "Enable" : "Disable"} percent threshold`,
-					`Set used-tokens value… (now ${usedText})`,
-					`${config.usedTokensEnabled === false ? "Enable" : "Disable"} used-tokens threshold`,
-				]);
+				const usage = ctx.getContextUsage();
+				const known =
+					usage && usage.tokens !== null && Number.isFinite(usage.contextWindow) && usage.contextWindow > 0;
+				const effective = known
+					? computeThresholds(config, (usage as { contextWindow: number }).contextWindow, builtIn)
+					: null;
+				const winner = effective?.source ?? null;
+				const title = known
+					? `Auto-compact — used ${fmt((usage as { tokens: number }).tokens)} / ${fmt((usage as { contextWindow: number }).contextWindow)}, lowest wins (Esc exits)`
+					: "Auto-compact thresholds (Esc exits)";
+
+				const row = (target: "percent" | "used"): string => {
+					const isPercent = target === "percent";
+					const value = isPercent ? config.percentThreshold : config.usedTokensThreshold;
+					const enabled = isPercent ? config.percentEnabled : config.usedTokensEnabled;
+					const name = isPercent ? "Percent" : "Used tokens";
+					if (value === undefined) return `${name}: not set`;
+					const shown = isPercent ? `${value}%` : `${fmt(value)} tokens`;
+					const wins = winner === target ? ", wins" : "";
+					return `${name}: ${shown} (${enabled === false ? "off" : "on"}${wins})`;
+				};
+				const percentRow = row("percent");
+				const usedRow = row("used");
+				const choice = await ctx.ui.select(title, [percentRow, usedRow]);
 				if (choice === undefined) break;
+				const target = choice === percentRow ? "percent" : "used";
+				const isPercent = target === "percent";
+
+				const action = await ctx.ui.select(choice, [
+					"Set value…",
+					`${(isPercent ? config.percentEnabled : config.usedTokensEnabled) === false ? "Enable" : "Disable"}`,
+					"Back",
+				]);
+				if (action === undefined || action === "Back") continue;
 				try {
-					if (choice.startsWith("Set percent")) {
-						const raw = await ctx.ui.input(
-							"Percent threshold (0-100)",
-							config.percentThreshold?.toString() ?? "90",
-						);
-						if (raw === undefined) continue;
-						const value = Number(raw.trim());
-						if (!(value > 0 && value <= 100)) {
-							notify(ctx, `${EXT_NAME}: percent must be in (0, 100], got "${raw.trim()}".`, "warning");
-							continue;
+					if (action === "Set value…") {
+						if (isPercent) {
+							const raw = await ctx.ui.input(
+								"Percent threshold (0-100)",
+								config.percentThreshold?.toString() ?? "90",
+							);
+							if (raw === undefined) continue;
+							const value = Number(raw.trim());
+							if (!(value > 0 && value <= 100)) {
+								notify(ctx, `${EXT_NAME}: percent must be in (0, 100], got "${raw.trim()}".`, "warning");
+								continue;
+							}
+							applyValue("percent", value);
+						} else {
+							const raw = await ctx.ui.input(
+								"Used-tokens threshold (positive integer)",
+								config.usedTokensThreshold?.toString() ?? "240000",
+							);
+							if (raw === undefined) continue;
+							const value = Number(raw.trim());
+							if (!(Number.isInteger(value) && value > 0)) {
+								notify(ctx, `${EXT_NAME}: used must be a positive integer, got "${raw.trim()}".`, "warning");
+								continue;
+							}
+							applyValue("used", value);
 						}
-						applyValue("percent", value);
-					} else if (choice.startsWith("Set used")) {
-						const raw = await ctx.ui.input(
-							"Used-tokens threshold (positive integer)",
-							config.usedTokensThreshold?.toString() ?? "240000",
-						);
-						if (raw === undefined) continue;
-						const value = Number(raw.trim());
-						if (!(Number.isInteger(value) && value > 0)) {
-							notify(ctx, `${EXT_NAME}: used must be a positive integer, got "${raw.trim()}".`, "warning");
-							continue;
-						}
-						applyValue("used", value);
-					} else if (choice.includes("percent threshold")) {
-						applyToggle("percent", config.percentEnabled === false);
+					} else if (action === "Enable") {
+						applyToggle(target, true);
 					} else {
-						applyToggle("used", config.usedTokensEnabled === false);
+						applyToggle(target, false);
 					}
 				} catch (error) {
 					notify(ctx, `${EXT_NAME}: ${error instanceof Error ? error.message : String(error)}`, "warning");
