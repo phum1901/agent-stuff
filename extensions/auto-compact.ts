@@ -331,6 +331,9 @@ export default function (pi: ExtensionAPI) {
 		const target = targetMap[parts[0] ?? ""];
 		if (!target) return { error: `unknown threshold "${parts[0] ?? ""}", use percent or used.` };
 		const arg = parts[1] ?? "";
+		if (arg === "") {
+			return { error: `missing value, use on / off or a number (e.g. /auto-compact ${target} ${target === "percent" ? "90" : "240000"}).` };
+		}
 		if (arg === "on" || arg === "off") return { target, next: arg === "on" };
 		const value = Number(arg);
 		if (!Number.isFinite(value)) {
@@ -347,57 +350,157 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("auto-compact", {
 		description: "Show auto-compact thresholds (no args) or set them: percent|used on|off|<value>",
 		getArgumentCompletions: (prefix) => {
-			const items = [
-				{ value: "percent on", label: "percent on", description: "Enable percent threshold" },
-				{ value: "percent off", label: "percent off", description: "Disable percent threshold" },
-				{ value: "percent ", label: "percent <0-100>", description: "Set percent, e.g. 90" },
-				{ value: "used on", label: "used on", description: "Enable used-tokens threshold" },
-				{ value: "used off", label: "used off", description: "Disable used-tokens threshold" },
-				{ value: "used ", label: "used <int>", description: "Set used tokens, e.g. 240000" },
-			];
+			const on = (target: "percent" | "used") => ({
+				value: `${target} on`,
+				label: `${target} on`,
+				description: `Enable ${target} threshold`,
+			});
+			const off = (target: "percent" | "used") => ({
+				value: `${target} off`,
+				label: `${target} off`,
+				description: `Disable ${target} threshold`,
+			});
 			const p = prefix.trim().toLowerCase();
-			const filtered = items.filter((i) => i.value.startsWith(p));
-			return filtered.length > 0 ? filtered : items;
+			if (p === "") {
+				return [
+					{ value: "percent ", label: "percent", description: "Percent threshold" },
+					{ value: "used ", label: "used", description: "Used-tokens threshold" },
+				];
+			}
+			const m = p.match(/^(percent|pct|used)\s*(.*)$/);
+			if (!m) return [];
+			const word = m[1] as "percent" | "pct" | "used";
+			const rest = m[2].trim();
+			const target = word === "used" ? "used" : "percent";
+			if (rest === "") {
+				// First token partial or complete target with no second token yet.
+				if (p.endsWith(" ") || word.length === p.length) {
+					const hint = target === "percent" ? "90" : "240000";
+					return [
+						on(target),
+						off(target),
+						{
+							value: `${target} `,
+							label: `${target} <${target === "percent" ? "0-100" : "int"}>`,
+							description: `Set value, e.g. ${hint}`,
+						},
+					];
+				}
+				return [
+					{ value: "percent ", label: "percent", description: "Percent threshold" },
+					{ value: "used ", label: "used", description: "Used-tokens threshold" },
+				].filter((i) => i.value.startsWith(p));
+			}
+			// Second token started: typing a number -> no popup, let Enter submit.
+			if (/^\d/.test(rest)) return [];
+			return [on(target), off(target)].filter((i) => i.value.startsWith(`${target} ${rest}`));
 		},
 		handler: async (args, ctx) => {
+			const applyValue = (target: "percent" | "used", value: number): void => {
+				const meta: { valueField: "percentThreshold" | "usedTokensThreshold"; flagField: "percentEnabled" | "usedTokensEnabled"; label: string } =
+					target === "percent"
+						? { valueField: "percentThreshold", flagField: "percentEnabled", label: "percentThreshold" }
+						: { valueField: "usedTokensThreshold", flagField: "usedTokensEnabled", label: "usedTokensThreshold" };
+				const path = writeProjectConfig(ctx.cwd, (obj) => {
+					obj[meta.valueField] = value;
+					delete obj[meta.flagField];
+				});
+				const label = target === "percent" ? `${value}%` : `${fmt(value)} tokens`;
+				notify(ctx, `${EXT_NAME}: ${meta.label} set to ${label}, wrote ${path}, active now.`, "info");
+			};
+			const applyToggle = (target: "percent" | "used", next: boolean): void => {
+				const meta: { valueField: "percentThreshold" | "usedTokensThreshold"; flagField: "percentEnabled" | "usedTokensEnabled"; label: string } =
+					target === "percent"
+						? { valueField: "percentThreshold", flagField: "percentEnabled", label: "percentThreshold" }
+						: { valueField: "usedTokensThreshold", flagField: "usedTokensEnabled", label: "usedTokensThreshold" };
+				if (config[meta.valueField] === undefined) {
+					notify(
+						ctx,
+						`${EXT_NAME}: ${meta.label} has no value yet, set one first (e.g. /auto-compact ${target} ${target === "percent" ? "90" : "240000"}).`,
+						"warning",
+					);
+					return;
+				}
+				const path = writeProjectConfig(ctx.cwd, (obj) => {
+					if (next) delete obj[meta.flagField];
+					else obj[meta.flagField] = false;
+				});
+				notify(ctx, `${EXT_NAME}: ${meta.label} ${next ? "enabled" : "disabled"}, wrote ${path}, active now.`, "info");
+			};
+
 			const trimmed = args.trim();
-			if (!trimmed) {
+			if (trimmed) {
+				const parsed = parseArgs(trimmed);
+				if ("error" in parsed) {
+					notify(ctx, `${EXT_NAME}: ${parsed.error}`, "warning");
+					return;
+				}
+				try {
+					if ("value" in parsed) applyValue(parsed.target, parsed.value);
+					else applyToggle(parsed.target, parsed.next);
+				} catch (error) {
+					notify(ctx, `${EXT_NAME}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				}
+				return;
+			}
+
+			// No args: status text, plus interactive menu in TUI (like /mode).
+			{
 				const { lines, level } = statusLines(ctx);
 				notify(ctx, lines.join("\n"), level);
-				return;
 			}
-			const parsed = parseArgs(trimmed);
-			if ("error" in parsed) {
-				notify(ctx, `${EXT_NAME}: ${parsed.error}`, "warning");
-				return;
-			}
-			const meta =
-				parsed.target === "percent"
-					? { valueField: "percentThreshold", flagField: "percentEnabled", label: "percentThreshold" }
-					: { valueField: "usedTokensThreshold", flagField: "usedTokensEnabled", label: "usedTokensThreshold" };
-			try {
-				if ("value" in parsed) {
-					const value = parsed.value;
-					const path = writeProjectConfig(ctx.cwd, (obj) => {
-						obj[meta.valueField] = value;
-						delete obj[meta.flagField];
-					});
-					const label = parsed.target === "percent" ? `${value}%` : `${fmt(value)} tokens`;
-					notify(ctx, `${EXT_NAME}: ${meta.label} set to ${label}, wrote ${path}, active now.`, "info");
-				} else {
-					const next = parsed.next;
-					if (config[meta.valueField as keyof AutoCompactConfig] === undefined) {
-						notify(ctx, `${EXT_NAME}: ${meta.label} has no value yet, set one first (e.g. /auto-compact ${parsed.target} ${parsed.target === "percent" ? "90" : "240000"}).`, "warning");
-						return;
+			if (!ctx.hasUI) return;
+
+			const percentText =
+				config.percentThreshold === undefined
+					? "not set"
+					: `${config.percentThreshold}% (${config.percentEnabled === false ? "off" : "on"})`;
+			const usedText =
+				config.usedTokensThreshold === undefined
+					? "not set"
+					: `${fmt(config.usedTokensThreshold)} tokens (${config.usedTokensEnabled === false ? "off" : "on"})`;
+
+			for (;;) {
+				const choice = await ctx.ui.select("Auto-compact thresholds (Esc exits)", [
+					`Set percent value… (now ${percentText})`,
+					`${config.percentEnabled === false ? "Enable" : "Disable"} percent threshold`,
+					`Set used-tokens value… (now ${usedText})`,
+					`${config.usedTokensEnabled === false ? "Enable" : "Disable"} used-tokens threshold`,
+				]);
+				if (choice === undefined) break;
+				try {
+					if (choice.startsWith("Set percent")) {
+						const raw = await ctx.ui.input(
+							"Percent threshold (0-100)",
+							config.percentThreshold?.toString() ?? "90",
+						);
+						if (raw === undefined) continue;
+						const value = Number(raw.trim());
+						if (!(value > 0 && value <= 100)) {
+							notify(ctx, `${EXT_NAME}: percent must be in (0, 100], got "${raw.trim()}".`, "warning");
+							continue;
+						}
+						applyValue("percent", value);
+					} else if (choice.startsWith("Set used")) {
+						const raw = await ctx.ui.input(
+							"Used-tokens threshold (positive integer)",
+							config.usedTokensThreshold?.toString() ?? "240000",
+						);
+						if (raw === undefined) continue;
+						const value = Number(raw.trim());
+						if (!(Number.isInteger(value) && value > 0)) {
+							notify(ctx, `${EXT_NAME}: used must be a positive integer, got "${raw.trim()}".`, "warning");
+							continue;
+						}
+						applyValue("used", value);
+					} else if (choice.includes("percent threshold")) {
+						applyToggle("percent", config.percentEnabled === false);
+					} else {
+						applyToggle("used", config.usedTokensEnabled === false);
 					}
-					const path = writeProjectConfig(ctx.cwd, (obj) => {
-						if (next) delete obj[meta.flagField];
-						else obj[meta.flagField] = false;
-					});
-					notify(ctx, `${EXT_NAME}: ${meta.label} ${next ? "enabled" : "disabled"}, wrote ${path}, active now.`, "info");
+				} catch (error) {
+					notify(ctx, `${EXT_NAME}: ${error instanceof Error ? error.message : String(error)}`, "warning");
 				}
-			} catch (error) {
-				notify(ctx, `${EXT_NAME}: ${error instanceof Error ? error.message : String(error)}`, "warning");
 			}
 		},
 	});
