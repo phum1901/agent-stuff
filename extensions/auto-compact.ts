@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import { boundaryTokens, compactBoundary } from "./lib/compact-boundary.ts";
 
 // =============================================================================
 // Types
@@ -160,9 +161,9 @@ function computeThresholds(
 export default function (pi: ExtensionAPI) {
 	let config: AutoCompactConfig = { enabled: true };
 	let issues: ConfigIssue[] = [];
-	let builtIn = { enabled: true, reserveTokens: 16384 };
-	let inFlight: Promise<boolean> | null = null;
-	let lastRunAborted = false;
+	let settingsManager: SettingsManager;
+	let inFlight: Promise<unknown> | null = null;
+	const terminatingTools = new Set<string>();
 
 	const fmt = (n: number): string => n.toLocaleString("en-US");
 
@@ -170,12 +171,12 @@ export default function (pi: ExtensionAPI) {
 		const loaded = loadConfig();
 		config = loaded.config;
 		issues = loaded.issues;
-		try {
-			const compaction = SettingsManager.create(cwd).getCompactionSettings();
-			builtIn = { enabled: compaction.enabled, reserveTokens: compaction.reserveTokens };
-		} catch {
-			builtIn = { enabled: true, reserveTokens: 16384 };
-		}
+		settingsManager = SettingsManager.create(cwd);
+	};
+
+	const builtInSettings = (ctx: ExtensionContext) => {
+		settingsManager.setProjectTrusted(ctx.isProjectTrusted());
+		return settingsManager.getCompactionSettings(ctx.model);
 	};
 
 	const notify = (ctx: ExtensionContext, message: string, type: "info" | "error" | "warning"): void => {
@@ -187,8 +188,8 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	// ctx.compact is fire-and-forget (void + callbacks). Wrap in a Promise so
-	// safe checkpoints can wait for compaction before the next turn starts.
+	// Manual compaction is safe only before a prompt, while the agent is idle.
+	// Wrap its callbacks so prompt startup waits until compaction completes.
 	const compactOnce = (ctx: ExtensionContext, reason: string): Promise<boolean> => {
 		const promise = new Promise<boolean>((resolve) => {
 			let settled = false;
@@ -214,7 +215,16 @@ export default function (pi: ExtensionAPI) {
 		return tracked;
 	};
 
-	const checkAndTrigger = (ctx: ExtensionContext): Promise<void> => {
+	const triggerReason = (tokens: number, contextWindow: number, ctx: ExtensionContext): string | undefined => {
+		const effective = computeThresholds(config, contextWindow, builtInSettings(ctx));
+		if (!effective.handleByExtension || effective.value === null) return;
+		// Past the built-in limit: let Pi run its native threshold/overflow path.
+		if (effective.builtInValue !== null && tokens > effective.builtInValue) return;
+		if (!(tokens > effective.value)) return;
+		return `used ${fmt(tokens)} tokens, reached ${fmt(effective.value)} (${effective.candidates[0]?.describe ?? ""})`;
+	};
+
+	const checkBeforePrompt = (ctx: ExtensionContext): Promise<void> => {
 		if (!config.enabled || inFlight || !ctx.isIdle() || ctx.hasPendingMessages()) {
 			return Promise.resolve();
 		}
@@ -222,42 +232,54 @@ export default function (pi: ExtensionAPI) {
 		if (!usage || usage.tokens === null || !Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0) {
 			return Promise.resolve();
 		}
-		const tokens = usage.tokens;
-		const effective = computeThresholds(config, usage.contextWindow, builtIn);
-		if (!effective.handleByExtension || effective.value === null) return Promise.resolve();
-		// Past the built-in limit: let pi native handle it (full threshold/overflow path).
-		if (effective.builtInValue !== null && tokens > effective.builtInValue) return Promise.resolve();
-		if (!(tokens > effective.value)) return Promise.resolve();
-		const lowest = effective.candidates[0];
-		inFlight = compactOnce(
-			ctx,
-			`used ${fmt(tokens)} tokens, reached ${fmt(effective.value)} (${lowest?.describe ?? ""})`,
-		);
+		const reason = triggerReason(usage.tokens, usage.contextWindow, ctx);
+		if (!reason) return Promise.resolve();
+		inFlight = compactOnce(ctx, reason);
 		return inFlight.then(() => undefined);
 	};
 
 	pi.on("session_start", (_event, ctx) => {
 		reloadAll(ctx.cwd);
 		inFlight = null;
-		lastRunAborted = false;
+		terminatingTools.clear();
 	});
 
-	pi.on("agent_end", (event) => {
-		const lastAssistant = [...event.messages].reverse().find((m) => m.role === "assistant");
-		lastRunAborted = lastAssistant?.stopReason === "aborted";
+	pi.on("turn_start", () => terminatingTools.clear());
+	pi.on("tool_execution_end", (event) => {
+		if (event.result.terminate === true) terminatingTools.add(event.toolCallId);
 	});
 
-	pi.on("agent_settled", async (_event, ctx) => {
-		if (lastRunAborted) {
-			lastRunAborted = false;
-			return;
+	const needsNextResponse = (event: TurnEndEvent, ctx: ExtensionContext): boolean => {
+		if (!event.context.canContinue) return false;
+		if (event.continue || ctx.hasPendingMessages() || event.context.pendingMessages.length > 0) return true;
+		return event.toolResults.length > 0 && !event.toolResults.every((result) => terminatingTools.has(result.toolCallId));
+	};
+
+	pi.on("turn_end", async (event, ctx) => {
+		if (!config.enabled || inFlight || event.outcome !== "completed" || ctx.signal?.aborted || !needsNextResponse(event, ctx)) return;
+		const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
+		if (!contextWindow || !Number.isFinite(contextWindow) || contextWindow <= 0) return;
+		const tokens = boundaryTokens(event, ctx);
+		const reason = triggerReason(tokens, contextWindow, ctx);
+		if (!reason) return;
+		const operation = compactBoundary(event, ctx, builtInSettings(ctx), tokens, settingsManager.getRetrySettings());
+		inFlight = operation;
+		try {
+			const result = await operation;
+			if (result) notify(ctx, `${EXT_NAME}: ${reason}, checkpoint prepared`, "info");
+			return result;
+		} catch (error) {
+			if (!ctx.signal?.aborted) {
+				notify(ctx, `${EXT_NAME}: ${reason}, compact failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+		} finally {
+			if (inFlight === operation) inFlight = null;
 		}
-		await checkAndTrigger(ctx);
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		if (inFlight) await inFlight;
-		await checkAndTrigger(ctx);
+		await checkBeforePrompt(ctx);
 	});
 
 	// ---------- single command: status + control ----------
@@ -271,7 +293,7 @@ export default function (pi: ExtensionAPI) {
 		if (!usage || usage.tokens === null || !Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0) {
 			lines.push("Context usage unknown (no model or no messages yet), cannot compute thresholds.");
 		} else {
-			const effective = computeThresholds(config, usage.contextWindow, builtIn);
+			const effective = computeThresholds(config, usage.contextWindow, builtInSettings(ctx));
 			lines.push(`Model context window: ${fmt(usage.contextWindow)} tokens`);
 			lines.push("Thresholds in used-tokens (lowest wins):");
 			for (const c of effective.candidates) {
@@ -447,7 +469,7 @@ export default function (pi: ExtensionAPI) {
 				const known =
 					usage && usage.tokens !== null && Number.isFinite(usage.contextWindow) && usage.contextWindow > 0;
 				const effective = known
-					? computeThresholds(config, (usage as { contextWindow: number }).contextWindow, builtIn)
+					? computeThresholds(config, (usage as { contextWindow: number }).contextWindow, builtInSettings(ctx))
 					: null;
 				const winner = effective?.source ?? null;
 				const title = known
