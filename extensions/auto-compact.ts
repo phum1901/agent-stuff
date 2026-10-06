@@ -265,6 +265,7 @@ export default function (pi: ExtensionAPI) {
 		const operation = compactBoundary(event, ctx, builtInSettings(ctx), tokens, settingsManager.getRetrySettings());
 		inFlight = operation;
 		try {
+			if (ctx.hasUI) ctx.ui.setWorkingMessage("Auto-compacting...");
 			const result = await operation;
 			if (result) notify(ctx, `${EXT_NAME}: ${reason}, checkpoint prepared`, "info");
 			return result;
@@ -274,6 +275,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		} finally {
 			if (inFlight === operation) inFlight = null;
+			if (ctx.hasUI) ctx.ui.setWorkingMessage();
 		}
 	});
 

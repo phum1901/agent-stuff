@@ -48,6 +48,7 @@ async function setup(tokens = 71000) {
 	let idle = true;
 	let pending = false;
 	const notifications: string[] = [];
+	const workingMessages: (string | undefined)[] = [];
 	const manualCompact = mock.fn((options: any) => options.onComplete({}));
 	const controller = new AbortController();
 	const ctx = {
@@ -57,7 +58,10 @@ async function setup(tokens = 71000) {
 		isProjectTrusted: () => false,
 		isIdle: () => idle, hasPendingMessages: () => pending,
 		getContextUsage: () => ({ tokens, contextWindow: 100000, percent: tokens / 1000 }),
-		compact: manualCompact, ui: { notify: (text: string) => notifications.push(text) },
+		compact: manualCompact, ui: {
+			notify: (text: string) => notifications.push(text),
+			setWorkingMessage: (message?: string) => workingMessages.push(message),
+		},
 	};
 	autoCompact({
 		on: (name: string, handler: Function) => handlers.set(name, handler),
@@ -72,7 +76,7 @@ async function setup(tokens = 71000) {
 		context: { contextEntries: session.buildSessionProjection().entries,
 			contextMessages: session.buildSessionProjection().messages, pendingMessages: [], canContinue: true },
 	};
-	return { ctx, event, emit, handlers, notifications, manualCompact, controller,
+	return { ctx, event, emit, handlers, notifications, workingMessages, manualCompact, controller,
 		setIdle: (value: boolean) => { idle = value; },
 		setPending: (value: boolean) => { pending = value; } };
 }
@@ -90,6 +94,26 @@ test("compacts after tools during an active run without manual compaction or for
 	assert.deepEqual(result.entries.at(-1).usage, { input: 100, output: 10, totalTokens: 110 });
 });
 
+test("shows the working message only while the summary is running", async () => {
+	const s = await setup();
+	s.setIdle(false);
+	let finish!: (result: any) => void;
+	compact.mock.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+	const operation = s.emit("turn_end", s.event);
+	await Promise.resolve();
+	assert.deepEqual(s.workingMessages, ["Auto-compacting..."]);
+	finish({ summary: "Checkpoint", firstKeptEntryId: s.event.messageEntryId });
+	await operation;
+	assert.deepEqual(s.workingMessages, ["Auto-compacting...", undefined]);
+});
+
+test("compacts without UI calls in headless mode", async () => {
+	const s = await setup();
+	s.ctx.hasUI = false;
+	assert.ok((await s.emit("turn_end", s.event))?.entries);
+	assert.deepEqual(s.workingMessages, []);
+});
+
 test("does not compact at settlement or after a final answer with no next response", async () => {
 	const s = await setup();
 	assert.equal(s.handlers.has("agent_settled"), false);
@@ -97,6 +121,7 @@ test("does not compact at settlement or after a final answer with no next respon
 	s.event.context.canContinue = false;
 	assert.equal(await s.emit("turn_end", s.event), undefined);
 	assert.equal(compact.mock.callCount(), 0);
+	assert.deepEqual(s.workingMessages, []);
 });
 
 test("queued messages do not prevent between-turn compaction", async () => {
@@ -167,6 +192,7 @@ test("compaction errors leave the active run and entries unchanged", async () =>
 	assert.equal(await s.emit("turn_end", s.event), undefined);
 	assert.equal(s.manualCompact.mock.callCount(), 0);
 	assert.ok(s.notifications.some((message) => message.includes("Provider unavailable")));
+	assert.deepEqual(s.workingMessages, ["Auto-compacting...", undefined]);
 });
 
 test("waits for one summary and honours cancellation", async () => {
@@ -180,12 +206,14 @@ test("waits for one summary and honours cancellation", async () => {
 	finish({ summary: "Cancelled summary", firstKeptEntryId: s.event.messageEntryId });
 	assert.equal(await first, undefined);
 	assert.equal(s.manualCompact.mock.callCount(), 0);
+	assert.deepEqual(s.workingMessages, ["Auto-compacting...", undefined]);
 });
 
 test("retains the idle pre-prompt check and disables extension thresholds when configured off", async () => {
 	const s = await setup();
 	await s.emit("before_agent_start");
 	assert.equal(s.manualCompact.mock.callCount(), 1);
+	assert.deepEqual(s.workingMessages, []);
 	writeFileSync(join(agentDir, "auto-compact.json"), JSON.stringify({ enabled: false, percentThreshold: 70 }));
 	const s2 = await setup();
 	assert.equal(await s2.emit("turn_end", s2.event), undefined);
