@@ -1,146 +1,102 @@
 /**
- * Tools Extension
+ * Read-only tool inspector.
  *
- * Provides a /tools command to enable/disable tools interactively.
- * Tool selection persists across session reloads and respects branch navigation.
- *
- * Usage:
- * 1. Copy this file to ~/.pi/agent/extensions/ or your project's .pi/extensions/
- * 2. Use /tools to open the tool selector
+ * /tools shows exposure, model activation and codemode access.
+ * It does not change active tools or restore saved selections.
  */
 
-import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui";
-
-// State persisted to session
-interface ToolsState {
-	enabledTools: string[];
-}
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	fuzzyFilter,
+	getKeybindings,
+	Input,
+	type SelectItem,
+	SelectList,
+	Text,
+	truncateToWidth,
+} from "@earendil-works/pi-tui";
 
 export default function toolsExtension(pi: ExtensionAPI) {
-	// Track enabled tools
-	let enabledTools: Set<string> = new Set();
-	let allTools: ToolInfo[] = [];
-
-	// Persist current state
-	function persistState() {
-		pi.appendEntry<ToolsState>("tools-config", {
-			enabledTools: Array.from(enabledTools),
-		});
-	}
-
-	// Apply current tool selection
-	function applyTools() {
-		pi.setActiveTools(Array.from(enabledTools));
-	}
-
-	// Find the last tools-config entry in the current branch
-	function restoreFromBranch(ctx: ExtensionContext) {
-		allTools = pi.getAllTools();
-
-		// Get entries in current branch only
-		const branchEntries = ctx.sessionManager.getBranch();
-		let savedTools: string[] | undefined;
-
-		for (const entry of branchEntries) {
-			if (entry.type === "custom" && entry.customType === "tools-config") {
-				const data = entry.data as ToolsState | undefined;
-				if (data?.enabledTools) {
-					savedTools = data.enabledTools;
-				}
-			}
-		}
-
-		if (savedTools) {
-			// Restore saved tool selection (filter to only tools that still exist)
-			const allToolNames = allTools.map((t) => t.name);
-			enabledTools = new Set(savedTools.filter((t: string) => allToolNames.includes(t)));
-			applyTools();
-		} else {
-			// No saved state - sync with currently active tools
-			enabledTools = new Set(pi.getActiveTools());
-		}
-	}
-
-	// Register /tools command
 	pi.registerCommand("tools", {
-		description: "Enable/disable tools",
+		description: "Inspect tool access (read-only)",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/tools requires TUI mode", "error");
 				return;
 			}
 
-			// Refresh tool list
-			allTools = pi.getAllTools();
-
-			await ctx.ui.custom((tui, theme, _kb, done) => {
-				// Build settings items for each tool
-				const items: SettingItem[] = allTools.map((tool) => ({
-					id: tool.name,
+			// Read a fresh snapshot on each open. Pi owns tool activation.
+			const activeTools = new Set(pi.getActiveTools());
+			const items: SelectItem[] = pi.getAllTools().map((tool) => {
+				const active = activeTools.has(tool.name);
+				const callable = tool.exposure === "codemode" || tool.exposure === "deferred" ||
+					(tool.exposure === "direct" && active);
+				return {
+					value: tool.name,
 					label: tool.name,
-					currentValue: enabledTools.has(tool.name) ? "enabled" : "disabled",
-					values: ["enabled", "disabled"],
-				}));
+					description: `Exposure: ${tool.exposure} | Model: ${active ? "active" : "inactive"} | Codemode: ${callable ? "yes" : "no"}`,
+				};
+			});
 
-				const container = new Container();
-				container.addChild(
-					new (class {
-						render(_width: number) {
-							return [theme.fg("accent", theme.bold("Tool Configuration")), ""];
-						}
-						invalidate() {}
-					})(),
-				);
+			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+				const search = new Input({ prompt: "Search: " });
+				const details = new Text("", 0, 0);
+				const title = new Text(theme.fg("accent", theme.bold("Tools (read-only snapshot)")), 0, 0);
+				const hint = new Text(theme.fg("dim", "Type to search · ↑↓ scroll · Enter/Esc close"), 0, 0);
+				const listTheme = {
+					selectedPrefix: (text: string) => theme.fg("accent", text),
+					selectedText: (text: string) => theme.fg("accent", text),
+					description: (text: string) => theme.fg("muted", text),
+					scrollInfo: (text: string) => theme.fg("dim", text),
+					noMatch: (text: string) => theme.fg("warning", text),
+				};
 
-				const settingsList = new SettingsList(
-					items,
-					Math.min(items.length + 2, 15),
-					getSettingsListTheme(),
-					(id, newValue) => {
-						// Update enabled state and apply immediately
-						if (newValue === "enabled") {
-							enabledTools.add(id);
-						} else {
-							enabledTools.delete(id);
-						}
-						applyTools();
-						persistState();
-					},
-					() => {
-						// Close dialog
-						done(undefined);
-					},
-				);
+				function updateDetails(item: SelectItem | null) {
+					details.setText(item ? `${item.label}\n${item.description}` : "No matching tools");
+				}
 
-				container.addChild(settingsList);
+				function createList(query: string) {
+					const filtered = fuzzyFilter(items, query, (item) => item.value);
+					const list = new SelectList(filtered, Math.max(1, Math.min(filtered.length, 12)), listTheme);
+					list.onSelectionChange = updateDetails;
+					updateDetails(list.getSelectedItem());
+					return list;
+				}
 
-				const component = {
+				let list = createList("");
+				return {
+					get focused() { return search.focused; },
+					set focused(value: boolean) { search.focused = value; },
 					render(width: number) {
-						return container.render(width);
+						return [
+							...title.render(width), "", ...search.render(width), "",
+							...list.render(width), "", ...details.render(width), "", ...hint.render(width),
+						].map((line) => truncateToWidth(line, width));
 					},
 					invalidate() {
-						container.invalidate();
+						title.invalidate();
+						search.invalidate();
+						list.invalidate();
+						details.invalidate();
+						hint.invalidate();
 					},
 					handleInput(data: string) {
-						settingsList.handleInput?.(data);
+						const kb = getKeybindings();
+						if (kb.matches(data, "tui.select.cancel") || kb.matches(data, "tui.select.confirm")) {
+							done(undefined);
+							return;
+						}
+						if (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down")) {
+							list.handleInput(data);
+						} else {
+							const previous = search.getValue();
+							search.handleInput(data);
+							if (search.getValue() !== previous) list = createList(search.getValue());
+						}
 						tui.requestRender();
 					},
 				};
-
-				return component;
 			});
 		},
-	});
-
-	// Restore state on session start
-	pi.on("session_start", async (_event, ctx) => {
-		restoreFromBranch(ctx);
-	});
-
-	// Restore state when navigating the session tree
-	pi.on("session_tree", async (_event, ctx) => {
-		restoreFromBranch(ctx);
 	});
 }
